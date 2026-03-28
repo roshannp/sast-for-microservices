@@ -526,7 +526,7 @@ def tool_scan_repository(repo_name: str, clone_url: str,
     dest = tmp_dir / repo_name
     if not dest.exists():
         auth_url = clone_url.replace("https://", f"https://x-access-token:{token}@")
-        r = subprocess.run(["git","clone","--depth=1", auth_url, str(dest)],
+        r = subprocess.run(["git","clone", auth_url, str(dest)],
                            capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             return json.dumps({"error": f"Clone failed: {r.stderr[:200]}"})
@@ -604,6 +604,153 @@ def tool_check_dependencies(repo_name: str) -> str:
         "high":          sum(1 for c in cves if c.severity == HIGH),
         "findings":      [c.to_dict() for c in cves],
     })
+
+
+def tool_scan_commit_history(repo_name: str,
+                              patterns: List[str] = None,
+                              max_commits: int = 500) -> str:
+    """
+    Scan git commit history for secrets/patterns that may have been
+    added and later deleted (still permanently in git history).
+    Uses `git log -p -S <pattern>` (pickaxe search).
+    """
+    repo_path = _cloned_repos.get(repo_name)
+    if not repo_path:
+        return json.dumps({"error": f"Repo {repo_name} not cloned yet"})
+
+    default_patterns = [
+        "SECRET_KEY", "PASSWORD", "API_KEY", "PRIVATE_KEY", "ACCESS_KEY",
+        "AUTH_TOKEN", "DB_PASS", "CLIENT_SECRET", "STRIPE_KEY", "AWS_SECRET",
+    ]
+    search_patterns = patterns or default_patterns
+
+    findings = []
+    seen_commits = set()
+
+    for pattern in search_patterns:
+        try:
+            result = subprocess.run(
+                ["git", "log", f"--max-count={max_commits}", "--all",
+                 "--oneline", f"-S{pattern}", "--format=%H|%an|%ae|%ad|%s"],
+                cwd=str(repo_path),
+                capture_output=True, text=True, timeout=60
+            )
+            for line in result.stdout.strip().splitlines():
+                if not line.strip() or "|" not in line:
+                    continue
+                parts = line.split("|", 4)
+                if len(parts) < 5:
+                    continue
+                commit_hash, author, email, date, subject = parts
+                commit_hash = commit_hash.strip()
+                if commit_hash in seen_commits:
+                    continue
+                seen_commits.add(commit_hash)
+
+                # Get the diff for this commit to show the actual secret context
+                diff_result = subprocess.run(
+                    ["git", "show", "--stat", commit_hash],
+                    cwd=str(repo_path),
+                    capture_output=True, text=True, timeout=30
+                )
+                findings.append({
+                    "pattern":     pattern,
+                    "commit":      commit_hash[:10],
+                    "author":      author.strip(),
+                    "email":       email.strip(),
+                    "date":        date.strip(),
+                    "subject":     subject.strip(),
+                    "files_changed": diff_result.stdout[:500],
+                    "severity":    CRITICAL,
+                    "note":        "Pattern found in commit history — may be deleted from current code but still in git history"
+                })
+        except subprocess.TimeoutExpired:
+            findings.append({"error": f"Timeout scanning for pattern: {pattern}"})
+        except Exception as e:
+            findings.append({"error": str(e)})
+
+    # Also check for secrets in current HEAD diff vs all branches
+    try:
+        branch_result = subprocess.run(
+            ["git", "branch", "-a"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=10
+        )
+        branches = [b.strip().lstrip("* ") for b in branch_result.stdout.splitlines()]
+    except Exception:
+        branches = ["main"]
+
+    return json.dumps({
+        "repo":           repo_name,
+        "commits_with_secrets": len(findings),
+        "patterns_searched":    search_patterns,
+        "branches_detected":    branches[:10],
+        "findings":             findings,
+        "warning": (
+            "Even if secrets were deleted from current code, "
+            "they remain in git history forever unless history is rewritten."
+        ) if findings else None
+    })
+
+
+def tool_git_blame_finding(repo_name: str, file_path: str,
+                             line_number: int) -> str:
+    """
+    Run git blame on a specific line to identify WHO introduced
+    a vulnerability, WHEN, and in WHICH commit.
+    """
+    repo_path = _cloned_repos.get(repo_name)
+    if not repo_path:
+        return json.dumps({"error": f"Repo {repo_name} not cloned"})
+
+    full_path = repo_path / file_path
+    if not full_path.exists():
+        return json.dumps({"error": f"File not found: {file_path}"})
+
+    try:
+        # Blame the specific line
+        result = subprocess.run(
+            ["git", "blame", "-L", f"{line_number},{line_number}",
+             "--porcelain", str(full_path)],
+            cwd=str(repo_path),
+            capture_output=True, text=True, timeout=30
+        )
+        out = result.stdout
+
+        # Parse porcelain blame output
+        commit  = out[:40] if len(out) >= 40 else "unknown"
+        author  = next((l[7:] for l in out.splitlines() if l.startswith("author ")), "unknown")
+        email   = next((l[13:] for l in out.splitlines() if l.startswith("author-mail ")), "")
+        time_ts = next((l[12:] for l in out.splitlines() if l.startswith("author-time ")), "")
+        summary = next((l[8:] for l in out.splitlines() if l.startswith("summary ")), "")
+
+        # Convert timestamp
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(int(time_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            dt = time_ts
+
+        # Get the commit message in full
+        log_result = subprocess.run(
+            ["git", "log", "-1", "--format=%B", commit.strip()],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=15
+        )
+
+        return json.dumps({
+            "repo":           repo_name,
+            "file":           file_path,
+            "line":           line_number,
+            "introduced_by":  author.strip(),
+            "email":          email.strip().strip("<>"),
+            "commit":         commit.strip()[:10],
+            "date":           dt,
+            "commit_message": (log_result.stdout.strip() or summary)[:200],
+            "insight": f"This vulnerability was introduced by {author.strip()} on {dt} in commit {commit.strip()[:10]}"
+        })
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "git blame timed out"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 def tool_finish_report(executive_summary: str,
@@ -697,6 +844,55 @@ TOOL_DEFS = [
     {
         "type": "function",
         "function": {
+            "name": "scan_commit_history",
+            "description": (
+                "Search the full git commit history of a repo for secrets or sensitive patterns "
+                "that may have been added and later deleted — they remain in git history forever. "
+                "Call this after scan_repository for any repo that had hardcoded credential findings, "
+                "or for security-sensitive repos (auth, payment, api-gateway)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_name": {"type": "string"},
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Secret patterns to search for. Leave empty to use defaults (SECRET_KEY, PASSWORD, API_KEY, etc.)"
+                    },
+                    "max_commits": {
+                        "type": "integer",
+                        "description": "Max commits to scan (default 500)",
+                        "default": 500
+                    }
+                },
+                "required": ["repo_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_blame_finding",
+            "description": (
+                "Run git blame on a specific file and line to find out WHO introduced "
+                "a vulnerability, WHEN, and in WHICH commit. "
+                "Call this for confirmed Critical or High findings to identify the source."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_name":   {"type": "string"},
+                    "file_path":   {"type": "string", "description": "Relative file path"},
+                    "line_number": {"type": "integer", "description": "Line number of the vulnerability"}
+                },
+                "required": ["repo_name", "file_path", "line_number"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_report",
             "description": (
                 "Call this ONLY when you have finished scanning all repositories and checking all dependencies. "
@@ -735,18 +931,21 @@ SYSTEM_PROMPT = """You are an elite security engineer conducting a comprehensive
 
 Your mission:
 1. Call list_repositories to see all repos
-2. Scan every repository using scan_repository (prioritise repos with names suggesting auth, payment, user-data, ai, llm, api-gateway)
-3. For every CRITICAL or HIGH finding, call read_code_context to confirm it is a real vulnerability (not test code, commented out, or benign)
-4. Call check_dependencies for every scanned repository to find CVE vulnerabilities
-5. After all repos are scanned, call finish_report with your executive summary
+2. Scan every repository using scan_repository (prioritise: auth, payment, user-data, ai, llm, api-gateway)
+3. For every CRITICAL or HIGH finding, call read_code_context to confirm it is real (not test code, commented out, or benign)
+4. Call check_dependencies for every repo to find CVE vulnerabilities in dependencies
+5. Call scan_commit_history for any repo that had hardcoded credential findings, OR for security-sensitive repos (auth, payment, gateway) — secrets deleted from code live in git history forever
+6. For every confirmed Critical finding, call git_blame_finding to identify who introduced it and when
+7. After all repos are done, call finish_report with your executive summary
 
 Key reasoning principles:
-- If code is in a test file (path contains test/, spec/, __tests__/) lower your confidence
-- If a credential looks like a placeholder (e.g. "your-secret-here", "CHANGE_ME") it may be benign
-- Repos with "ai", "llm", "ml", "gpt" in the name deserve extra scrutiny on LLM Top 10
-- Repos with "auth", "login", "token" deserve extra scrutiny on A07 Auth failures
-- Finding the same vulnerability across multiple repos = systemic issue, flag it clearly
-- Be concise in your tool calls — don't over-explain, just act
+- Test files (path contains test/, spec/, __tests__/) reduce confidence — flag but note
+- Placeholder credentials ("your-secret-here", "CHANGE_ME", "xxx") are likely benign
+- Repos with "ai", "llm", "ml", "gpt" → extra scrutiny on LLM Top 10
+- Repos with "auth", "login", "token" → extra scrutiny on A07 Auth failures
+- Same vulnerability across multiple repos = systemic issue — flag prominently
+- Commit history findings are HIGH severity even if deleted — they're in history forever
+- git blame gives you accountability — always run it for confirmed critical findings
 
 You are methodical, thorough, and focused. Begin by listing the repositories."""
 
@@ -1595,6 +1794,28 @@ Examples:
                 result = tool_check_dependencies(args_d.get("repo_name",""))
                 try:
                     d=json.loads(result);print(f"       → {d.get('total_cves',0)} CVEs found")
+                except Exception: pass
+
+            elif fn == "scan_commit_history":
+                result = tool_scan_commit_history(
+                    args_d.get("repo_name",""),
+                    args_d.get("patterns", None),
+                    args_d.get("max_commits", 500))
+                try:
+                    d = json.loads(result)
+                    n = d.get("commits_with_secrets", 0)
+                    print(f"       → {n} commits with secrets in history")
+                except Exception: pass
+
+            elif fn == "git_blame_finding":
+                result = tool_git_blame_finding(
+                    args_d.get("repo_name",""),
+                    args_d.get("file_path",""),
+                    args_d.get("line_number", 1))
+                try:
+                    d = json.loads(result)
+                    if "introduced_by" in d:
+                        print(f"       → Introduced by {d['introduced_by']} on {d['date']} ({d['commit']})")
                 except Exception: pass
 
             elif fn == "finish_report":
