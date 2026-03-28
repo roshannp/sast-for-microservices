@@ -4,6 +4,8 @@ A GPT-4o powered security agent that audits your entire microservices org for OW
 
 Most SAST tools scan in isolation. This agent scans your whole environment, correlates findings across services, digs through git commit history, checks every dependency against CVE databases, and writes its own executive summary. It reasons, adapts, and remembers between scans.
 
+<img width="1624" height="988" alt="Screenshot 2026-03-27 at 10 10 01 PM" src="https://github.com/user-attachments/assets/0d424de9-cee0-469e-83c8-73e3abd1d617" />
+
 ---
 
 ## Why This Agent
